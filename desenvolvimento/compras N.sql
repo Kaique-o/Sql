@@ -592,27 +592,7 @@ WHERE
                         (COALESCE(VENDAS.Mes_Anterior_1, 0) + COALESCE(VENDAS.Mes_Anterior_2, 0)) / 2, 2
                     ), 0
                 ) > 1.2 THEN 'Queda'
-                ELSE 'Aumento'
-            END = 'Aumento' THEN 
-            GREATEST(
-                CEIL(((VENDAS.Vendas_Ultimos_30_Dias * 1.05) / 30) * :P_LEADTIME) 
-                - COALESCE(CE.ESTOQUE, 0) + COALESCE(TE.EST_TRANS, 0) 
-                - COALESCE(
-                    (SELECT COALESCE(SUM(
-    CASE 
-        WHEN (ITE.QTDNEG - ITE.QTDENTREGUE) > 0 THEN (ITE.QTDNEG - ITE.QTDENTREGUE) 
-        ELSE 0 
-    END
-), 0) AS QTD_PENDENTE
-FROM TGFITE ITE
-INNER JOIN TGFCAB CAB ON ITE.NUNOTA = CAB.NUNOTA
-WHERE 
-    CAB.CODTIPOPER IN (1301)
-    AND CAB.STATUSNOTA IN ('L','A')
-    AND CAB.DTNEG > TO_DATE('01/07/2024', 'DD/MM/YYYY')
-    AND ITE.CODPROD = PRO.CODPROD -- Filtra pelo produto atual
-    AND CAB.CODEMP = 8
-                    ), 0)
+                ELSEzz
             , 0)
         WHEN 
             CASE
