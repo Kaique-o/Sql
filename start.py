@@ -313,10 +313,8 @@ def summarize_ora_errors(log_path: str, tail_lines: int = 50):
     _, out2, _ = exec_in_container(f"tail -n {tail_lines} {log_path}")
     print(out2 or "(log vazio)")
 
-
 def recreate_user(user: str, password: str):
-    # Usa heredoc com quote para evitar expansion de !, $, etc. pelo shell
-    cmd = f"""sqlplus -s system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} <<'SQL'
+    sqlblock = f"""
 WHENEVER SQLERROR CONTINUE
 DROP USER {user} CASCADE;
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -326,14 +324,63 @@ CREATE USER {user} IDENTIFIED BY "{password}"
   QUOTA UNLIMITED ON USERS;
 GRANT CONNECT, RESOURCE TO {user};
 GRANT CREATE VIEW, CREATE PROCEDURE, CREATE SEQUENCE, CREATE TRIGGER TO {user};
-SQL
 """
+    cmd = f"sqlplus -s system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} <<'SQL'\n{sqlblock}\nSQL"
     code, out, err = exec_in_container(cmd)
     if code != 0:
         print("⚠️ Problema ao (re)criar usuário:", err or out)
     else:
         print(f"✅ Usuário {user} (re)criado com sucesso.")
 
+def schema_only_import_fix(dump_filename: str, schema_src: str, user_dest: str, user_dest_pwd: str):
+    print(f"📦 Import schema-only: dump={dump_filename}, schema_origem={schema_src}, destino={user_dest}")
+    recreate_user(user_dest, user_dest_pwd)
+
+    log_path = f"{CONTAINER_DPDUMP}/import_schema.log"
+    exec_in_container(f"rm -f {log_path}")
+
+    impdp_cmd = (
+        f"impdp system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} "
+        f"directory=dp_dir dumpfile={dump_filename} logfile=import_schema.log "
+        f"schemas={schema_src} remap_schema={schema_src}:{user_dest} "
+        f"transform=segment_attributes:n "
+        f"exclude=JOB,DB_LINK,SYNONYM,STATISTICS,GRANT"
+    )
+
+    cmd = f"""\
+set -e
+( {impdp_cmd} ) &
+pid=$!
+echo "📝 Acompanhando import_schema.log (PID=$pid)..."
+for i in $(seq 1 120); do
+  [ -f {log_path} ] && break
+  sleep 1
+done
+if tail --help 2>/dev/null | grep -q -- "--pid"; then
+  tail -f {log_path} --pid $pid
+else
+  tail -f {log_path} &
+  t=$!
+  wait $pid || true
+  kill $t 2>/dev/null || true
+fi
+wait $pid
+"""
+    code, out, err = exec_in_container(cmd)
+    summarize_ora_errors(log_path)
+    if code != 0:
+        print("❌ Import schema-only terminou com erro (ver resumo acima).")
+        return False
+
+    print("✅ Import schema-only concluído.")
+    check_sql = f"""
+set pages 100 lines 200 feedback off
+SELECT table_name, num_rows FROM all_tables WHERE owner=upper('{user_dest}') ORDER BY num_rows DESC FETCH FIRST 20 ROWS ONLY;
+"""
+    cmd = f'echo "{check_sql}" | sqlplus -s system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE}'
+    _, out, _ = exec_in_container(cmd)
+    print("\n📊 Top 20 tabelas (num_rows):\n" + (out or "(sem retorno)"))
+    return True
 
 def diagnose_dump(dump_filename: str):
     print(f"🧪 Diagnóstico do dump: {dump_filename} (gerando DDL preview, sem alterar o banco)")
@@ -499,32 +546,8 @@ def menu():
                 except Exception:
                     print("Opção inválida."); input("Pressione ENTER para voltar ao menu..."); continue
 
-            
-            raw_schema = input("Schema de ORIGEM (padrão: SKWCLOUD): ").strip()
-            if not raw_schema or raw_schema.isdigit():
-                print("↪️ Entrada vazia ou numérica detectada. Usando padrão: SKWCLOUD")
-                schema_src = "SKWCLOUD"
-            else:
-                # validação básica: permitir letras, números e underscore
-                cleaned = raw_schema.strip().upper()
-                if not all(c.isalnum() or c == "_" for c in cleaned):
-                    print("↪️ Caracteres inválidos no schema. Usando padrão: SKWCLOUD")
-                    schema_src = "SKWCLOUD"
-                else:
-                    schema_src = cleaned
-
-            raw_user = input("Usuário DESTINO (padrão: SKY_USER): ").strip()
-            if not raw_user:
-                print("↪️ Usando padrão: SKY_USER")
-                user_dest = "SKY_USER"
-            else:
-                cleaned_u = raw_user.strip().upper()
-                if not all(c.isalnum() or c == "_" for c in cleaned_u):
-                    print("↪️ Caracteres inválidos no usuário destino. Usando padrão: SKY_USER")
-                    user_dest = "SKY_USER"
-                else:
-                    user_dest = cleaned_u
-
+            schema_src = input("Schema de ORIGEM (padrão: SKWCLOUD): ").strip() or "SKWCLOUD"
+            user_dest = input("Usuário DESTINO (padrão: SKY_USER): ").strip() or "SKY_USER"
             user_dest_pwd = input(f"Senha do usuário {user_dest} (padrão: MinhaSenha!1): ").strip() or "MinhaSenha!1"
 
             try:
