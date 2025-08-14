@@ -1,7 +1,6 @@
 
 import json
 import hashlib
-import os
 import subprocess
 import sys
 import time
@@ -54,7 +53,7 @@ def run(cmd, check=True, capture_output=False, shell=False):
         return e.returncode, out, err
     except FileNotFoundError:
         print("❌ Comando não encontrado. Verifique se o Docker está instalado e no PATH.")
-        sys.exit(1)
+        return 127, "", "not found"
 
 def docker_available():
     code, _, _ = run(["docker", "--version"], check=False, capture_output=True)
@@ -73,7 +72,7 @@ def ensure_image(image: str):
         code, out, err = run(["docker", "pull", image], check=False, capture_output=True)
         if code != 0:
             print("❌ Falha ao baixar a imagem:", err or out)
-            sys.exit(1)
+            raise RuntimeError("Falha ao baixar imagem Docker")
         print("✅ Imagem baixada.")
 
 def container_exists(name: str) -> bool:
@@ -100,7 +99,7 @@ def start_container():
     if code != 0:
         print("❌ Falha ao subir o container.")
         print(err or out)
-        sys.exit(1)
+        raise RuntimeError("Falha ao subir container")
     print("✅ Container iniciado.")
 
 def ensure_running():
@@ -111,7 +110,7 @@ def ensure_running():
         code, out, err = run(["docker","start", CONTAINER_NAME], check=False, capture_output=True)
         if code != 0:
             print("❌ Não consegui iniciar o container:", err or out)
-            sys.exit(1)
+            raise RuntimeError("Falha ao iniciar container")
         print("✅ Container em execução.")
     else:
         print("ℹ️ Container já está em execução.")
@@ -172,6 +171,7 @@ def file_fingerprint(path: Path) -> str:
     try:
         stat = path.stat()
         base = f"{path.name}|{stat.st_size}|{int(stat.st_mtime)}"
+        import hashlib
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
     except FileNotFoundError:
         return ""
@@ -242,16 +242,18 @@ wait $pid
     if tail_out:
         print(tail_out)
 
-    if code != 0:
-        print("❌ Import terminou com erro.")
+    # Checa sucesso no log explicitamente
+    _, grep_ok, _ = exec_in_container(f"grep -i 'successfully completed' {CONTAINER_DPDUMP}/import.log || true")
+    if code == 0 and grep_ok:
+        # Atualiza state
+        state["last_import_fp"] = current_fp
+        state["last_import_file"] = dump_filename
+        save_state(folder, state)
+        print("✅ Import concluído e estado atualizado. Pronto para usar.")
+        return True
+    else:
+        print("❌ Import terminou com erro ou sem confirmação de sucesso no log.")
         return False
-
-    # Atualiza state
-    state["last_import_fp"] = current_fp
-    state["last_import_file"] = dump_filename
-    save_state(folder, state)
-    print("✅ Import concluído e estado atualizado. Pronto para usar.")
-    return True
 
 def print_db_ready_banner():
     print("\n================= PRONTO PARA USAR =================")
@@ -269,18 +271,16 @@ def open_sqlplus_interactive():
     base = ["docker","exec","-it",CONTAINER_NAME,"bash","-lc",cmd]
     subprocess.call(base)
 
-def stop_and_remove_container():
+def stop_container_only():
     print("🛑 Parando container (se estiver em execução)...")
     run(["docker","stop", CONTAINER_NAME], check=False)
-    print("🧹 Removendo container (se existir)...")
-    run(["docker","rm", CONTAINER_NAME], check=False)
-    print("✅ Container parado e removido.")
+    print("✅ Container parado.")
 
 def setup_new_machine():
     """Passo 3: Setup de Docker/Imagem/Container para máquina nova."""
     if not docker_available():
         print("❌ Docker não encontrado. Instale o Docker Desktop e execute novamente.")
-        sys.exit(1)
+        return
     ensure_directory(Path(WIN_DMP_DIR))
     ensure_image(IMAGE)
     if not container_exists(CONTAINER_NAME):
@@ -290,7 +290,7 @@ def setup_new_machine():
     if not container_running(CONTAINER_NAME):
         ensure_running()
     if not wait_db_ready():
-        sys.exit(1)
+        return
     ensure_directory_dp_dir()
     print_db_ready_banner()
 
@@ -300,71 +300,77 @@ def setup_new_machine():
 def menu():
     if not docker_available():
         print("❌ Docker não encontrado. Instale o Docker Desktop e tente novamente.")
-        sys.exit(1)
+        return
 
     dump_folder = Path(WIN_DMP_DIR)
     if not dump_folder.exists():
         print(f"❌ Pasta de dumps não existe: {WIN_DMP_DIR}")
-        sys.exit(1)
+        return
 
     while True:
-        print("\n=== MENU ORACLE 23c FREE ===")
-        print("[1] Fazer TUDO que é necessário sempre (subir/verificar Docker + DB, esperar ficar pronto, garantir DIRECTORY)")
-        print("[2] Importar DMP SOMENTE se mudou (caso necessário) — retorna ao menu ao terminar")
-        print("[3] Setup de Docker/Imagem/Container (máquina nova)")
-        print("[4] Parar/remover container e SAIR")
-        choice = input("Escolha: ").strip()
+        try:
+            print("\n=== MENU ORACLE 23c FREE ===")
+            print("[1] Fazer TUDO que é necessário sempre (subir/verificar Docker + DB, esperar ficar pronto, garantir DIRECTORY)")
+            print("[2] Importar DMP SOMENTE se mudou (caso necessário) — retorna ao menu ao terminar")
+            print("[3] Setup de Docker/Imagem/Container (máquina nova)")
+            print("[4] Parar container (não remove) e SAIR")
+            choice = input("Escolha: ").strip()
 
-        if choice == "1":
-            ensure_image(IMAGE)
-            ensure_running()
-            if not wait_db_ready():
+            if choice == "1":
+                ensure_image(IMAGE)
+                ensure_running()
+                if not wait_db_ready():
+                    input("Pressione ENTER para voltar ao menu...")
+                    continue
+                ensure_directory_dp_dir()
+                print_db_ready_banner()
+                if input("Deseja abrir SQL*Plus agora? (s/n): ").strip().lower() == "s":
+                    open_sqlplus_interactive()
                 input("Pressione ENTER para voltar ao menu...")
-                continue
-            ensure_directory_dp_dir()
-            print_db_ready_banner()
-            if input("Deseja abrir SQL*Plus agora? (s/n): ").strip().lower() == "s":
-                open_sqlplus_interactive()
-            input("Pressione ENTER para voltar ao menu...")
 
-        elif choice == "2":
-            ensure_image(IMAGE)
-            ensure_running()
-            if not wait_db_ready():
+            elif choice == "2":
+                ensure_image(IMAGE)
+                ensure_running()
+                if not wait_db_ready():
+                    input("Pressione ENTER para voltar ao menu...")
+                    continue
+                ensure_directory_dp_dir()
+                dumps = list_dmp_files()
+                if not dumps:
+                    print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
+                    input("Pressione ENTER para voltar ao menu...")
+                else:
+                    print("Dumps disponíveis:")
+                    for i, f in enumerate(dumps, start=1):
+                        print(f"  {i}) {f}")
+                    sel = input("Escolha o número do dump para verificar/importar: ").strip()
+                    try:
+                        dump = dumps[int(sel)-1]
+                    except Exception:
+                        print("Opção inválida.")
+                        input("Pressione ENTER para voltar ao menu...")
+                        dump = None
+                    if dump:
+                        _ = import_dump_if_needed(dump, dump_folder)
+                        print_db_ready_banner()
+                        input("Pressione ENTER para voltar ao menu...")
+
+            elif choice == "3":
+                setup_new_machine()
                 input("Pressione ENTER para voltar ao menu...")
-                continue
-            ensure_directory_dp_dir()
-            dumps = list_dmp_files()
-            if not dumps:
-                print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
-                input("Pressione ENTER para voltar ao menu...")
+
+            elif choice == "4":
+                stop_container_only()
+                print("👋 Encerrando execução...")
+                sys.exit(0)
+
             else:
-                print("Dumps disponíveis:")
-                for i, f in enumerate(dumps, start=1):
-                    print(f"  {i}) {f}")
-                sel = input("Escolha o número do dump para verificar/importar: ").strip()
-                try:
-                    dump = dumps[int(sel)-1]
-                except Exception:
-                    print("Opção inválida.")
-                    input("Pressione ENTER para voltar ao menu...")
-                    dump = None
-                if dump:
-                    import_dump_if_needed(dump, dump_folder)
-                    print_db_ready_banner()
-                    input("Pressione ENTER para voltar ao menu...")
-
-        elif choice == "3":
-            setup_new_machine()
-            input("Pressione ENTER para voltar ao menu...")
-
-        elif choice == "4":
-            stop_and_remove_container()
-            print("👋 Encerrando execução...")
-            sys.exit(0)
-
-        else:
-            print("Opção inválida.")
+                print("Opção inválida.")
+                input("Pressione ENTER para voltar ao menu...")
+        except KeyboardInterrupt:
+            print("\n⛔ Interrompido pelo usuário. Voltando ao menu...")
+        except Exception as e:
+            print(f"\n⚠️ Erro inesperado: {e}")
             input("Pressione ENTER para voltar ao menu...")
 
 if __name__ == "__main__":
