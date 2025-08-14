@@ -216,19 +216,16 @@ def import_dump_if_needed(dump_filename: str, folder: Path) -> bool:
         f"directory=dp_dir dumpfile={dump_filename} logfile=import.log"
     )
 
-    # Roda o impdp e faz tail do log até terminar (tail --pid encerra junto)
-    # Se --pid não existir, ao menos veremos o log enquanto roda.
+    # Roda o impdp e faz tail do log até terminar
     cmd = f"""\
 set -e
 ( {impdp_cmd} ) &
 pid=$!
 echo "📝 Acompanhando import.log (PID=$pid)..."
-# espera o log aparecer
 for i in $(seq 1 120); do
   [ -f {CONTAINER_DPDUMP}/import.log ] && break
   sleep 1
 done
-# tail com --pid se disponível
 if tail --help 2>/dev/null | grep -q -- "--pid"; then
   tail -f {CONTAINER_DPDUMP}/import.log --pid $pid
 else
@@ -240,7 +237,7 @@ fi
 wait $pid
 """
     code, out, err = exec_in_container(cmd)
-    # Mostra última linha do log pra indicar status
+    # Mostra últimas linhas do log para status
     _, tail_out, _ = exec_in_container(f"tail -n 5 {CONTAINER_DPDUMP}/import.log")
     if tail_out:
         print(tail_out)
@@ -269,9 +266,15 @@ def print_db_ready_banner():
 def open_sqlplus_interactive():
     print("🔗 Abrindo SQL*Plus interativo (CTRL+C para sair)...")
     cmd = f"sqlplus system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE}"
-    # Interativo = aloca TTY
     base = ["docker","exec","-it",CONTAINER_NAME,"bash","-lc",cmd]
     subprocess.call(base)
+
+def stop_and_remove_container():
+    print("🛑 Parando container (se estiver em execução)...")
+    run(["docker","stop", CONTAINER_NAME], check=False)
+    print("🧹 Removendo container (se existir)...")
+    run(["docker","rm", CONTAINER_NAME], check=False)
+    print("✅ Container parado e removido.")
 
 def setup_new_machine():
     """Passo 3: Setup de Docker/Imagem/Container para máquina nova."""
@@ -307,30 +310,34 @@ def menu():
     while True:
         print("\n=== MENU ORACLE 23c FREE ===")
         print("[1] Fazer TUDO que é necessário sempre (subir/verificar Docker + DB, esperar ficar pronto, garantir DIRECTORY)")
-        print("[2] Importar DMP SOMENTE se mudou (caso necessário)")
+        print("[2] Importar DMP SOMENTE se mudou (caso necessário) — retorna ao menu ao terminar")
         print("[3] Setup de Docker/Imagem/Container (máquina nova)")
-        print("[4] Sair")
+        print("[4] Parar/remover container e SAIR")
         choice = input("Escolha: ").strip()
 
         if choice == "1":
             ensure_image(IMAGE)
             ensure_running()
             if not wait_db_ready():
+                input("Pressione ENTER para voltar ao menu...")
                 continue
             ensure_directory_dp_dir()
             print_db_ready_banner()
             if input("Deseja abrir SQL*Plus agora? (s/n): ").strip().lower() == "s":
                 open_sqlplus_interactive()
+            input("Pressione ENTER para voltar ao menu...")
 
         elif choice == "2":
             ensure_image(IMAGE)
             ensure_running()
             if not wait_db_ready():
+                input("Pressione ENTER para voltar ao menu...")
                 continue
             ensure_directory_dp_dir()
             dumps = list_dmp_files()
             if not dumps:
                 print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
+                input("Pressione ENTER para voltar ao menu...")
             else:
                 print("Dumps disponíveis:")
                 for i, f in enumerate(dumps, start=1):
@@ -340,19 +347,25 @@ def menu():
                     dump = dumps[int(sel)-1]
                 except Exception:
                     print("Opção inválida.")
+                    input("Pressione ENTER para voltar ao menu...")
                     dump = None
                 if dump:
                     import_dump_if_needed(dump, dump_folder)
+                    print_db_ready_banner()
+                    input("Pressione ENTER para voltar ao menu...")
 
         elif choice == "3":
             setup_new_machine()
+            input("Pressione ENTER para voltar ao menu...")
 
         elif choice == "4":
-            print("👋 Saindo...")
-            break
+            stop_and_remove_container()
+            print("👋 Encerrando execução...")
+            sys.exit(0)
 
         else:
             print("Opção inválida.")
+            input("Pressione ENTER para voltar ao menu...")
 
 if __name__ == "__main__":
     menu()
