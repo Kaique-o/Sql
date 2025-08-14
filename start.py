@@ -57,7 +57,6 @@ def run(cmd, check=True, capture_output=False, shell=False):
             res = subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False, shell=shell)
             return res.returncode, _decode(res.stdout), _decode(res.stderr)
         else:
-            # When not capturing, still avoid locale decoding issues
             res = subprocess.run(cmd, check=check, shell=shell)
             return res.returncode, "", ""
     except subprocess.CalledProcessError as e:
@@ -184,7 +183,6 @@ def list_dmp_files():
         return []
 
 def file_fingerprint(path: Path) -> str:
-    """Gera uma assinatura baseada em tamanho + mtime para evitar custo de hash em arquivos grandes."""
     try:
         stat = path.stat()
         base = f"{path.name}|{stat.st_size}|{int(stat.st_mtime)}"
@@ -206,7 +204,6 @@ def save_state(folder: Path, state: dict):
     state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def import_dump_if_needed(dump_filename: str, folder: Path) -> bool:
-    """Importa o dump apenas se mudou desde a última importação. Retorna True se importou, False se pulou."""
     dumps = list_dmp_files()
     if dump_filename not in dumps:
         print(f"❌ Dump '{dump_filename}' não encontrado em {folder}")
@@ -222,9 +219,7 @@ def import_dump_if_needed(dump_filename: str, folder: Path) -> bool:
         print("✅ Pronto para usar (sem necessidade de importar novamente).")
         return False
 
-    # Executa impdp e acompanha o log em tempo real
     print(f"📦 Iniciando import do dump: {dump_filename}")
-    # Garante que o log antigo não polua a saída
     exec_in_container(f"rm -f {CONTAINER_DPDUMP}/import.log")
 
     impdp_cmd = (
@@ -232,7 +227,6 @@ def import_dump_if_needed(dump_filename: str, folder: Path) -> bool:
         f"directory=dp_dir dumpfile={dump_filename} logfile=import.log"
     )
 
-    # Roda o impdp e faz tail do log até terminar
     cmd = f"""\
 set -e
 ( {impdp_cmd} ) &
@@ -253,7 +247,6 @@ fi
 wait $pid
 """
     code, out, err = exec_in_container(cmd)
-    # Mostra últimas linhas do log para status
     _, tail_out, _ = exec_in_container(f"tail -n 5 {CONTAINER_DPDUMP}/import.log")
     if tail_out:
         print(tail_out)
@@ -262,7 +255,6 @@ wait $pid
         print("❌ Import terminou com erro.")
         return False
 
-    # Atualiza state
     state["last_import_fp"] = current_fp
     state["last_import_file"] = dump_filename
     save_state(folder, state)
@@ -291,7 +283,6 @@ def stop_container_only():
     print("✅ Container parado. (Não removido)")
 
 def setup_new_machine():
-    """Passo 3: Setup de Docker/Imagem/Container para máquina nova."""
     if not docker_available():
         print("❌ Docker não encontrado. Instale o Docker Desktop e execute novamente.")
         return False
@@ -310,6 +301,87 @@ def setup_new_machine():
     ensure_directory_dp_dir()
     print_db_ready_banner()
     return True
+
+# ===== Helpers para correção (Opção 5) e Diagnóstico (Opção 6) =====
+
+def summarize_ora_errors(log_path: str, tail_lines: int = 50):
+    print("🔎 Resumo dos erros ORA- no log:")
+    cmd_count = f"grep -o 'ORA-[0-9]\\\\+' {log_path} | sort | uniq -c | sort -nr | head -20"
+    _, out1, _ = exec_in_container(cmd_count)
+    print(out1 or "(nenhum ORA- encontrado)")
+    print("\n📝 Últimas linhas do log:")
+    _, out2, _ = exec_in_container(f"tail -n {tail_lines} {log_path}")
+    print(out2 or "(log vazio)")
+
+
+def recreate_user(user: str, password: str):
+    # Usa heredoc com quote para evitar expansion de !, $, etc. pelo shell
+    cmd = f"""sqlplus -s system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} <<'SQL'
+WHENEVER SQLERROR CONTINUE
+DROP USER {user} CASCADE;
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+CREATE USER {user} IDENTIFIED BY "{password}"
+  DEFAULT TABLESPACE USERS
+  TEMPORARY TABLESPACE TEMP
+  QUOTA UNLIMITED ON USERS;
+GRANT CONNECT, RESOURCE TO {user};
+GRANT CREATE VIEW, CREATE PROCEDURE, CREATE SEQUENCE, CREATE TRIGGER TO {user};
+SQL
+"""
+    code, out, err = exec_in_container(cmd)
+    if code != 0:
+        print("⚠️ Problema ao (re)criar usuário:", err or out)
+    else:
+        print(f"✅ Usuário {user} (re)criado com sucesso.")
+
+
+def diagnose_dump(dump_filename: str):
+    print(f"🧪 Diagnóstico do dump: {dump_filename} (gerando DDL preview, sem alterar o banco)")
+    ddl_path = f"{CONTAINER_DPDUMP}/ddl_preview.sql"
+    log_path = f"{CONTAINER_DPDUMP}/diagnose.log"
+    exec_in_container(f"rm -f {ddl_path} {log_path}")
+
+    impdp_cmd = (
+        f"impdp system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} "
+        f"directory=dp_dir dumpfile={dump_filename} "
+        f"content=METADATA_ONLY sqlfile=ddl_preview.sql logfile=diagnose.log"
+    )
+    code, out, err = exec_in_container(impdp_cmd)
+    _, tail_out, _ = exec_in_container(f"tail -n 20 {log_path}")
+    print("📝 diagnose.log (últimas linhas):\n" + (tail_out or "(vazio)"))
+
+    schema_extract = (
+        f"awk 'match($0, /CREATE (TABLE|VIEW|SEQUENCE|PROCEDURE|FUNCTION|PACKAGE|TRIGGER|INDEX) \\\"([^\\\"]+)\\\"\\./, m){{print m[2]}}' {ddl_path} "
+        "| sort | uniq -c | sort -nr | head -30"
+    )
+    _, schemas_out, _ = exec_in_container(schema_extract)
+
+    tbs_extract = f"grep -o 'TABLESPACE \\\"[^\\\"]*\\\"' {ddl_path} | sed 's/TABLESPACE \\\"//;s/\\\"//' | sort | uniq -c | sort -nr"
+    _, tbs_out, _ = exec_in_container(tbs_extract)
+
+    dblinks_extract = f"grep -o 'DATABASE LINK \\\"[^\\\"]*\\\"' {ddl_path} | sed 's/DATABASE LINK \\\"//;s/\\\"//' | sort | uniq -c | sort -nr"
+    _, dblink_out, _ = exec_in_container(dblinks_extract)
+
+    print("\n📚 Schemas detectados no DDL (top 30 por ocorrência):")
+    print(schemas_out or "(nenhum detectado)")
+
+    print("\n💽 Tablespaces referenciadas no DDL:")
+    print(tbs_out or "(nenhuma encontrada)")
+
+    print("\n🔗 DB Links referenciados no DDL:")
+    print(dblink_out or "(nenhum encontrado)")
+
+    ts_sql = """
+set pages 100 lines 200
+COLUMN TABLESPACE_NAME FORMAT A30
+SELECT TABLESPACE_NAME, STATUS, CONTENTS, BIGFILE FROM dba_tablespaces ORDER BY TABLESPACE_NAME;
+"""
+    cmd = f'echo "{ts_sql}" | sqlplus -s system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE}'
+    _, ts_out, _ = exec_in_container(cmd)
+    print("\n🗄️ Tablespaces EXISTENTES no destino:")
+    print(ts_out or "(sem retorno)")
+
+    print("\n✅ Diagnóstico concluído. Use as infos acima para definir SCHEMA de origem, REMAP_SCHEMA e possíveis REMAP_TABLESPACE.")
 
 # =======================
 # MENU
@@ -332,6 +404,8 @@ def menu():
         print("[2] Importar DMP SOMENTE se mudou (caso necessário) — retorna ao menu ao terminar")
         print("[3] Setup de Docker/Imagem/Container (máquina nova)")
         print("[4] Encerrar serviços (parar container) e SAIR")
+        print("[5] Reimportar (schema-only) para corrigir erros comuns")
+        print("[6] Diagnóstico do dump (DDL preview, schemas/tablespaces/links)")
         choice = input("Escolha: ").strip()
 
         if choice == "1":
@@ -399,6 +473,103 @@ def menu():
             stop_container_only()
             print("👋 Encerrando execução...")
             break
+
+        elif choice == "5":
+            if not ensure_image(IMAGE):
+                input("Pressione ENTER para voltar ao menu..."); continue
+            if not ensure_running():
+                input("Pressione ENTER para voltar ao menu..."); continue
+            if not wait_db_ready():
+                input("Pressione ENTER para voltar ao menu..."); continue
+            ensure_directory_dp_dir()
+            dumps = list_dmp_files()
+            if not dumps:
+                print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
+                input("Pressione ENTER para voltar ao menu..."); continue
+            if len(dumps) == 1:
+                dump = dumps[0]
+                print(f"ℹ️ Apenas um dump encontrado. Usando: {dump}")
+            else:
+                print("Dumps disponíveis:")
+                for i, f in enumerate(dumps, start=1):
+                    print(f"  {i}) {f}")
+                sel = input("Escolha o número do dump: ").strip()
+                try:
+                    dump = dumps[int(sel)-1]
+                except Exception:
+                    print("Opção inválida."); input("Pressione ENTER para voltar ao menu..."); continue
+
+            
+            raw_schema = input("Schema de ORIGEM (padrão: SKWCLOUD): ").strip()
+            if not raw_schema or raw_schema.isdigit():
+                print("↪️ Entrada vazia ou numérica detectada. Usando padrão: SKWCLOUD")
+                schema_src = "SKWCLOUD"
+            else:
+                # validação básica: permitir letras, números e underscore
+                cleaned = raw_schema.strip().upper()
+                if not all(c.isalnum() or c == "_" for c in cleaned):
+                    print("↪️ Caracteres inválidos no schema. Usando padrão: SKWCLOUD")
+                    schema_src = "SKWCLOUD"
+                else:
+                    schema_src = cleaned
+
+            raw_user = input("Usuário DESTINO (padrão: SKY_USER): ").strip()
+            if not raw_user:
+                print("↪️ Usando padrão: SKY_USER")
+                user_dest = "SKY_USER"
+            else:
+                cleaned_u = raw_user.strip().upper()
+                if not all(c.isalnum() or c == "_" for c in cleaned_u):
+                    print("↪️ Caracteres inválidos no usuário destino. Usando padrão: SKY_USER")
+                    user_dest = "SKY_USER"
+                else:
+                    user_dest = cleaned_u
+
+            user_dest_pwd = input(f"Senha do usuário {user_dest} (padrão: MinhaSenha!1): ").strip() or "MinhaSenha!1"
+
+            try:
+                ok = schema_only_import_fix(dump, schema_src, user_dest, user_dest_pwd)
+                if ok:
+                    print_db_ready_banner()
+            except KeyboardInterrupt:
+                print("\n⚠️ Reimportação interrompida pelo usuário.")
+            except Exception as e:
+                print(f"❌ Erro inesperado na reimportação: {e}")
+            finally:
+                input("Pressione ENTER para voltar ao menu...")
+
+        elif choice == "6":
+            if not ensure_image(IMAGE):
+                input("Pressione ENTER para voltar ao menu..."); continue
+            if not ensure_running():
+                input("Pressione ENTER para voltar ao menu..."); continue
+            if not wait_db_ready():
+                input("Pressione ENTER para voltar ao menu..."); continue
+            ensure_directory_dp_dir()
+            dumps = list_dmp_files()
+            if not dumps:
+                print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
+                input("Pressione ENTER para voltar ao menu..."); continue
+            if len(dumps) == 1:
+                dump = dumps[0]
+                print(f"ℹ️ Apenas um dump encontrado. Usando: {dump}")
+            else:
+                print("Dumps disponíveis:")
+                for i, f in enumerate(dumps, start=1):
+                    print(f"  {i}) {f}")
+                sel = input("Escolha o número do dump: ").strip()
+                try:
+                    dump = dumps[int(sel)-1]
+                except Exception:
+                    print("Opção inválida."); input("Pressione ENTER para voltar ao menu..."); continue
+            try:
+                diagnose_dump(dump)
+            except KeyboardInterrupt:
+                print("\n⚠️ Diagnóstico interrompido pelo usuário.")
+            except Exception as e:
+                print(f"❌ Erro inesperado no diagnóstico: {e}")
+            finally:
+                input("Pressione ENTER para voltar ao menu...")
 
         else:
             print("Opção inválida.")
